@@ -1,41 +1,89 @@
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.Ref;
 import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevCommit;
+import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.jgit.storage.file.FileRepositoryBuilder;
 
 public class Main {
 
 	public static void main(String[] args) throws Exception {
         final Path tempPath = Path.of("target", "checkout");
+        // final Path tempPath = Path.of("C:\\Dev\\src\\campus\\mpo\\mpo-ui\\.git");
         final String repoName = "mpo-ui";
+
+        if (Files.notExists(tempPath)) {
+            throw new RuntimeException("The path " + tempPath + " does not exist.");
+        }
 
         CommitDatabase database = new DummyCommitDatabase();
 
-		FileRepositoryBuilder builder = new FileRepositoryBuilder();
-		Repository repository = builder.setGitDir(tempPath.toFile()).findGitDir().setBare().build();
+        Repository repository = openRepository(tempPath);
 		
-        Ref master = repository.getRefDatabase().exactRef("refs/heads/master");
-
-        RevCommit commit = repository.parseCommit(master.getObjectId());
-
-        System.out.println(commit.getName());
-        System.out.println(commit.getAuthorIdent());
-        System.out.println(commit.getCommitTime());
-        System.out.println(commit.getParents());
-
         long snapshotId = database.createSnapshot(repoName);
 
-        saveBranches(database, repoName, snapshotId, branches(repository));
+        // saveBranches(database, repoName, snapshotId, branches(repository));
         
-        saveReleases(repository, database, repoName);
+        // saveReleases(repository, database, repoName);
+
+        Ref master = repository.getRefDatabase().exactRef("refs/heads/master");
+        saveCommits(repository, database, repoName);
+    }
+
+    static void saveCommits(Repository repo, CommitDatabase database, String repoName) throws Exception {
+        List<Ref> branches = findBranchesSortedByDate(repo);
+        List<Ref> releases = findReleasesSortedByDate(repo);
+        List<RevCommit> alreadyHandledCommits = new ArrayList<>();
+
+        try (RevWalk walk = new RevWalk(repo)) {
+            while (!releases.isEmpty()) {
+                final Ref release = releases.get(0);
+                final RevCommit currentReleaseCommit = walk.parseCommit(release.getObjectId());
+                final long releaseTimestamp = currentReleaseCommit.getAuthorIdent().getWhen().getTime();
+
+                walk.markStart(currentReleaseCommit);
+                for (RevCommit alreadyHandledCommit : alreadyHandledCommits) {
+                    walk.markUninteresting(alreadyHandledCommit);
+                }
+
+                RevCommit commit;
+                long count = 0;
+
+                while ((commit = walk.next()) != null) {
+                    Set<String> parents = Arrays.stream(commit.getParents()).map(parent -> parent.getName()).collect(Collectors.toSet());
+                    database.saveCommit(repoName,
+                            commit.getName(),
+                            commit.getAuthorIdent().getWhen().getTime(),
+                            release.getName(),
+                            releaseTimestamp, parents);
+                    ++count;
+                }
+
+                releases.remove(0);
+                alreadyHandledCommits.add(currentReleaseCommit);
+
+                System.out.println("Saved " + count + " commits");
+            }
+        }
+    }
+
+    static Repository openRepository(Path path) throws IOException {
+        FileRepositoryBuilder builder = new FileRepositoryBuilder();
+        return builder.setGitDir(path.toFile())
+                .findGitDir()
+                // .setBare()
+                .build();
     }
 
     static void saveBranches(CommitDatabase database, String repoName, long snapshotId, List<Ref> branches) throws Exception {
@@ -46,29 +94,27 @@ public class Main {
     }
 
     static void saveReleases(Repository repository, CommitDatabase database, String repoName) throws Exception {
-        for (Ref release : releases(repository)) {
+        for (Ref release : findReleasesSortedByDate(repository)) {
             System.out.println(release.getName());
             database.saveRelease(repoName, release.getName(), release.getObjectId().getName());
         }
     }
 
-    static List<Ref> releases(Repository repository) throws Exception {
-        return tags(repository).stream()
+    static List<Ref> findReleasesSortedByDate(Repository repository) throws Exception {
+        return findTagsSortedByDate(repository).stream()
                 .filter(ref -> ref.getName().matches(".+@[\\d\\.]+$"))
                 .collect(Collectors.toList());
     }
 
-    static List<Ref> branches(Repository repository) throws Exception {
+    static List<Ref> findBranchesSortedByDate(Repository repository) throws Exception {
         return repository.getRefDatabase().getRefsByPrefix(Constants.R_HEADS).stream()
                 .sorted(new SortByCommitDateComparator(repository))
-                // .map(ref -> ref.getName().substring(Constants.R_HEADS.length()))
                 .collect(Collectors.toList());
 	}
 
-    static List<Ref> tags(Repository repository) throws Exception {
+    static List<Ref> findTagsSortedByDate(Repository repository) throws Exception {
         return repository.getRefDatabase().getRefsByPrefix(Constants.R_TAGS).stream()
                 .sorted(new SortByCommitDateComparator(repository))
-                // .map(ref -> ref.getName().substring(Constants.R_TAGS.length()))
                 .collect(Collectors.toList());
     }
 
@@ -96,9 +142,7 @@ public class Main {
     interface CommitDatabase {
         long createSnapshot(String repoName);
 
-        void saveCommit(String repoName, String hash, long commitTimestamp, List<String> parents);
-
-        void markCommitAsReleased(String repoName, String hash, long releaseTimestamp);
+        void saveCommit(String repoName, String hash, long commitTimestamp, String releaseName, long releaseTimestamp, Set<String> parents);
 
         void saveBranch(String repoName, long snapshotId, String branchName, String commitHash);
 
@@ -113,13 +157,10 @@ public class Main {
         }
 
         @Override
-        public void saveCommit(String repoName, String hash, long commitTimestamp, List<String> parents) {
+        public void saveCommit(String repoName, String hash, long commitTimestamp, String releaseName, long releaseTimestamp,
+                Set<String> parents) {
 
-        }
-
-        @Override
-        public void markCommitAsReleased(String repoName, String hash, long releaseTimestamp) {
-
+            System.out.println("Commit " + hash + ": " + releaseName);
         }
 
         @Override
