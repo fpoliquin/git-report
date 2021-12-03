@@ -1,6 +1,8 @@
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -54,20 +56,27 @@ public class Main {
     }
 
     private static void exportRepo(final Path tempPath, final String repoName, CommitDatabase database) throws Exception {
+        System.out.println("Exporting repo " + repoName + "...");
+        Instant start = Instant.now();
+
         Repository repository = openRepository(tempPath);
-		
+
+        database.createRepo(repoName);
+
         long snapshotId = database.createSnapshot(repoName);
 
-        System.out.println("Created snapshot " + snapshotId);
+        System.out.println("Created snapshot " + repoName + "/" + snapshotId);
 
-        saveBranches(database, repoName, snapshotId, findBranchesSortedByDate(repository));
-        
-        saveReleases(repository, database, repoName);
+        exportBranches(database, repoName, snapshotId, findBranchesSortedByDate(repository));
+
+        exportReleases(repository, database, repoName);
 
         // saveCommits(repository, database, repoName);
+        System.out.println("Exported repo " + repoName + " in " + Duration.between(start, Instant.now()).getSeconds() + " sec.");
     }
 
     static void saveCommits(Repository repo, CommitDatabase database, String repoName) throws Exception {
+        System.out.println("Saving commits from " + repoName + "...");
         List<Ref> branches = findBranchesSortedByDate(repo);
         List<Ref> releases = findReleasesSortedByDate(repo);
         List<RevCommit> alreadyHandledCommits = new ArrayList<>();
@@ -144,15 +153,23 @@ public class Main {
                 .build();
     }
 
-    static void saveBranches(CommitDatabase database, String repoName, long snapshotId, List<Ref> branches) throws Exception {
+    static void exportBranches(CommitDatabase database, String repoName, long snapshotId, List<Ref> branches) throws Exception {
+        System.out.println("Exporting branches from " + repoName + "...");
+        Instant start = Instant.now();
+
         database.saveBranches(repoName,
                 snapshotId,
                 branches.stream()
                         .map(ref -> new SimpleRef(ref.getName(), Optional.empty(), ref.getObjectId().getName()))
                         .toList());
+
+        System.out.println("Exported branches from " + repoName + " in " + Duration.between(start, Instant.now()).getSeconds() + " sec.");
     }
 
-    static void saveReleases(Repository repository, CommitDatabase database, String repoName) throws Exception {
+    static void exportReleases(Repository repository, CommitDatabase database, String repoName) throws Exception {
+        System.out.println("Exporting releases from " + repoName + "...");
+        Instant start = Instant.now();
+
         List<Ref> releases = findReleasesSortedByDate(repository);
 
         database.saveReleases(repoName,
@@ -161,6 +178,8 @@ public class Main {
                                 findRefTimestamp(repository, ref),
                                 ref.getObjectId().getName()))
                         .toList());
+
+        System.out.println("Exported releases from " + repoName + " in " + Duration.between(start, Instant.now()).getSeconds() + " sec.");
     }
 
     static List<Ref> findReleasesSortedByDate(Repository repository) throws Exception {
@@ -203,6 +222,8 @@ public class Main {
     }
 
     interface CommitDatabase {
+        void createRepo(String repoName);
+
         long createSnapshot(String repoName);
 
         void saveCommit(String repoName, String hash, long commitTimestamp, String releaseName, Optional<Long> releaseTimestamp, Set<String> parents);
@@ -217,6 +238,11 @@ public class Main {
     }
 
     static class DummyCommitDatabase implements CommitDatabase {
+        @Override
+        public void createRepo(String repoName) {
+
+        }
+
         @Override
         public long createSnapshot(String repoName) {
             return 1;
@@ -261,6 +287,21 @@ public class Main {
         }
 
         @Override
+        public void createRepo(String repoName) {
+            jdbcTemplate.update(
+                    """
+                            merge into Repos
+                            using (values (?)) as src (Repo_Name)
+                            on Repos.Repo_Name = src.Repo_Name
+                            when matched then
+                                update set Repo_Name = src.Repo_Name
+                            when not matched then
+                                        insert (Repo_Name) values (src.Repo_Name);
+                            """,
+                    repoName);
+        }
+
+        @Override
         public long createSnapshot(String repoName) {
             SimpleJdbcInsert insert = new SimpleJdbcInsert(jdbcTemplate);
             insert.setGeneratedKeyName("Snapshot_Id");
@@ -294,9 +335,21 @@ public class Main {
 
         @Override
         public void saveReleases(String repoName, Collection<? extends SimpleRef> releases) {
-            jdbcTemplate.batchUpdate("insert into Releases(Repo_Name, Release_Name, Release_Timestamp, Commit_Hash) values(?, ?, ?, ?)",
+            jdbcTemplate.batchUpdate("""
+                    merge into Releases
+                    using (values (?, ?, ?, ?)) as src (Repo_Name, Release_Name, Release_Timestamp, Commit_Hash)
+                    on Releases.Repo_Name = src.Repo_Name and Releases.Release_Name = src.Release_Name
+                    when matched then
+                        update set Release_Timestamp = src.Release_Timestamp, Commit_Hash = src.Commit_Hash
+                    when not matched then
+                        insert (Repo_Name, Release_Name, Release_Timestamp, Commit_Hash) values (src.Repo_Name, src.Release_Name, src.Release_Timestamp, src.Commit_Hash);
+                    """,
                     releases.stream()
-                            .map(ref -> new Object[] { repoName, ref.name, new Date(ref.timestamp.get()), ref.commitHash })
+                            .map(ref -> new Object[] {
+                                    repoName,
+                                    ref.name,
+                                    new Date(ref.timestamp.get()),
+                                    ref.commitHash })
                             .toList());
         }
 
