@@ -6,6 +6,7 @@ import java.util.Arrays;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -29,15 +30,18 @@ public class Main {
 
         CommitDatabase database = new DummyCommitDatabase();
 
+        exportRepo(tempPath, repoName, database);
+    }
+
+    private static void exportRepo(final Path tempPath, final String repoName, CommitDatabase database) throws Exception {
         Repository repository = openRepository(tempPath);
 		
         long snapshotId = database.createSnapshot(repoName);
 
-        // saveBranches(database, repoName, snapshotId, branches(repository));
+        saveBranches(database, repoName, snapshotId, findBranchesSortedByDate(repository));
         
-        // saveReleases(repository, database, repoName);
+        saveReleases(repository, database, repoName);
 
-        Ref master = repository.getRefDatabase().exactRef("refs/heads/master");
         saveCommits(repository, database, repoName);
     }
 
@@ -47,42 +51,66 @@ public class Main {
         List<RevCommit> alreadyHandledCommits = new ArrayList<>();
 
         try (RevWalk walk = new RevWalk(repo)) {
-            while (!releases.isEmpty()) {
-                final Ref release = releases.get(0);
-                final RevCommit currentReleaseCommit = walk.parseCommit(release.getObjectId());
-                final long releaseTimestamp = currentReleaseCommit.getAuthorIdent().getWhen().getTime();
+            saveCommits(database, repoName, releases, alreadyHandledCommits, walk, true);
+            saveCommits(database, repoName, branches, alreadyHandledCommits, walk, false);
+        }
+    }
 
-                walk.markStart(currentReleaseCommit);
-                for (RevCommit alreadyHandledCommit : alreadyHandledCommits) {
-                    walk.markUninteresting(alreadyHandledCommit);
-                }
+    private static void saveCommits(CommitDatabase database, String repoName, List<Ref> roots, List<RevCommit> alreadyHandledCommits, RevWalk walk,
+            boolean rootsAreReleases)
+            throws IOException {
+        ArrayList<Ref> rootsToProcess = new ArrayList<>(roots);
 
-                RevCommit commit;
-                long count = 0;
+        while (!rootsToProcess.isEmpty()) {
+            final Ref root = rootsToProcess.get(0);
 
-                while ((commit = walk.next()) != null) {
-                    Set<String> parents = Arrays.stream(commit.getParents()).map(parent -> parent.getName()).collect(Collectors.toSet());
-                    database.saveCommit(repoName,
-                            commit.getName(),
-                            commit.getAuthorIdent().getWhen().getTime(),
-                            release.getName(),
-                            releaseTimestamp, parents);
-                    ++count;
-                }
+            // System.out.println(root.getName());
 
-                releases.remove(0);
-                alreadyHandledCommits.add(currentReleaseCommit);
+            final RevCommit currentCommit = walk.parseCommit(root.getObjectId());
 
-                System.out.println("Saved " + count + " commits");
+            final Optional<Long> currentCommitTimestamp = findCommitTimestamp(currentCommit);
+
+            walk.markStart(currentCommit);
+
+            for (RevCommit alreadyHandledCommit : alreadyHandledCommits) {
+                walk.markUninteresting(alreadyHandledCommit);
             }
+
+            RevCommit commit;
+            long count = 0;
+
+            while ((commit = walk.next()) != null) {
+                Set<String> parents = Arrays.stream(commit.getParents()).map(parent -> parent.getName()).collect(Collectors.toSet());
+                database.saveCommit(repoName,
+                        commit.getName(),
+                        commit.getAuthorIdent().getWhen().getTime(),
+                        root.getName(),
+                        rootsAreReleases ? currentCommitTimestamp : null,
+                        parents);
+                ++count;
+            }
+
+            rootsToProcess.remove(0);
+            alreadyHandledCommits.add(currentCommit);
+            walk.reset();
+
+            System.out.println("Saved " + count + " commits");
+        }
+    }
+
+    static Optional<Long> findCommitTimestamp(RevCommit commit) {
+        try {
+            return Optional.of(commit.getAuthorIdent().getWhen().getTime());
+        } catch (NullPointerException e) {
+            // Il y a un bug avec le commit 31f3d296eb1d0d50ed056c01c54dd60ea7bf62d7 dans mpo-ui
+            // java.lang.NullPointerException at org.eclipse.jgit.util.RawParseUtils.author(RawParseUtils.java:726)
+            return Optional.empty();
         }
     }
 
     static Repository openRepository(Path path) throws IOException {
         FileRepositoryBuilder builder = new FileRepositoryBuilder();
         return builder.setGitDir(path.toFile())
-                .findGitDir()
-                // .setBare()
                 .build();
     }
 
@@ -96,7 +124,8 @@ public class Main {
     static void saveReleases(Repository repository, CommitDatabase database, String repoName) throws Exception {
         for (Ref release : findReleasesSortedByDate(repository)) {
             System.out.println(release.getName());
-            database.saveRelease(repoName, release.getName(), release.getObjectId().getName());
+            RevCommit commit = repository.parseCommit(release.getObjectId());
+            database.saveRelease(repoName, release.getName(), commit.getAuthorIdent().getWhen().getTime(), release.getObjectId().getName());
         }
     }
 
@@ -142,23 +171,21 @@ public class Main {
     interface CommitDatabase {
         long createSnapshot(String repoName);
 
-        void saveCommit(String repoName, String hash, long commitTimestamp, String releaseName, long releaseTimestamp, Set<String> parents);
+        void saveCommit(String repoName, String hash, long commitTimestamp, String releaseName, Optional<Long> releaseTimestamp, Set<String> parents);
 
         void saveBranch(String repoName, long snapshotId, String branchName, String commitHash);
 
-        void saveRelease(String repoName, String releaseName, String commitHash);
+        void saveRelease(String repoName, String releaseName, long releaseTimestamp, String commitHash);
     }
 
     static class DummyCommitDatabase implements CommitDatabase {
         @Override
-        public
-        long createSnapshot(String repoName) {
+        public long createSnapshot(String repoName) {
             return 1;
         }
 
         @Override
-        public void saveCommit(String repoName, String hash, long commitTimestamp, String releaseName, long releaseTimestamp,
-                Set<String> parents) {
+        public void saveCommit(String repoName, String hash, long commitTimestamp, String releaseName, Optional<Long> releaseTimestamp, Set<String> parents) {
 
             System.out.println("Commit " + hash + ": " + releaseName);
         }
@@ -169,7 +196,7 @@ public class Main {
         }
 
         @Override
-        public void saveRelease(String repoName, String releaseName, String commitHash) {
+        public void saveRelease(String repoName, String releaseName, long releaseTimestamp, String commitHash) {
 
         }
     }
