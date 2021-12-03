@@ -3,6 +3,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
@@ -61,7 +62,7 @@ public class Main {
 
         saveBranches(database, repoName, snapshotId, findBranchesSortedByDate(repository));
         
-        // saveReleases(repository, database, repoName);
+        saveReleases(repository, database, repoName);
 
         // saveCommits(repository, database, repoName);
     }
@@ -119,6 +120,14 @@ public class Main {
         }
     }
 
+    static Optional<Long> findRefTimestamp(Repository repo, Ref ref) {
+        try {
+            return findCommitTimestamp(repo.parseCommit(ref.getObjectId()));
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
     static Optional<Long> findCommitTimestamp(RevCommit commit) {
         try {
             return Optional.of(commit.getAuthorIdent().getWhen().getTime());
@@ -136,18 +145,22 @@ public class Main {
     }
 
     static void saveBranches(CommitDatabase database, String repoName, long snapshotId, List<Ref> branches) throws Exception {
-        for (Ref branch : branches) {
-            System.out.println(branch.getName());
-            database.saveBranch(repoName, snapshotId, branch.getName(), branch.getObjectId().getName());
-        }
+        database.saveBranches(repoName,
+                snapshotId,
+                branches.stream()
+                        .map(ref -> new SimpleRef(ref.getName(), Optional.empty(), ref.getObjectId().getName()))
+                        .toList());
     }
 
     static void saveReleases(Repository repository, CommitDatabase database, String repoName) throws Exception {
-        for (Ref release : findReleasesSortedByDate(repository)) {
-            System.out.println(release.getName());
-            RevCommit commit = repository.parseCommit(release.getObjectId());
-            database.saveRelease(repoName, release.getName(), commit.getAuthorIdent().getWhen().getTime(), release.getObjectId().getName());
-        }
+        List<Ref> releases = findReleasesSortedByDate(repository);
+
+        database.saveReleases(repoName,
+                releases.stream()
+                        .map(ref -> new SimpleRef(ref.getName(),
+                                findRefTimestamp(repository, ref),
+                                ref.getObjectId().getName()))
+                        .toList());
     }
 
     static List<Ref> findReleasesSortedByDate(Repository repository) throws Exception {
@@ -194,7 +207,11 @@ public class Main {
 
         void saveCommit(String repoName, String hash, long commitTimestamp, String releaseName, Optional<Long> releaseTimestamp, Set<String> parents);
 
+        void saveBranches(String repoName, long snapshotId, Collection<? extends SimpleRef> branches);
+
         void saveBranch(String repoName, long snapshotId, String branchName, String commitHash);
+
+        void saveReleases(String repoName, Collection<? extends SimpleRef> releases);
 
         void saveRelease(String repoName, String releaseName, long releaseTimestamp, String commitHash);
     }
@@ -212,7 +229,17 @@ public class Main {
         }
 
         @Override
+        public void saveBranches(String repoName, long snapshotId, Collection<? extends SimpleRef> branches) {
+
+        }
+
+        @Override
         public void saveBranch(String repoName, long snapshotId, String branchName, String commitHash) {
+
+        }
+
+        @Override
+        public void saveReleases(String repoName, Collection<? extends SimpleRef> releases) {
 
         }
 
@@ -249,17 +276,46 @@ public class Main {
         @Override
         public void saveCommit(String repoName, String hash, long commitTimestamp, String releaseName, Optional<Long> releaseTimestamp, Set<String> parents) {
 
-            System.out.println("Commit " + hash + ": " + releaseName);
+        }
+
+        @Override
+        public void saveBranches(String repoName, long snapshotId, Collection<? extends SimpleRef> branches) {
+            jdbcTemplate.batchUpdate("insert into Branches(Repo_Name, Snapshot_Id, Branch_Name, Commit_Hash) values(?, ?, ?, ?)",
+                    branches.stream()
+                            .map(ref -> new Object[] { repoName, snapshotId, ref.name, ref.commitHash })
+                            .toList());
         }
 
         @Override
         public void saveBranch(String repoName, long snapshotId, String branchName, String commitHash) {
+            jdbcTemplate.update("insert into Branches(Repo_Name, Snapshot_Id, Branch_Name, Commit_Hash) values(?, ?, ?, ?)",
+                    repoName, snapshotId, branchName, commitHash);
+        }
 
+        @Override
+        public void saveReleases(String repoName, Collection<? extends SimpleRef> releases) {
+            jdbcTemplate.batchUpdate("insert into Releases(Repo_Name, Release_Name, Release_Timestamp, Commit_Hash) values(?, ?, ?, ?)",
+                    releases.stream()
+                            .map(ref -> new Object[] { repoName, ref.name, new Date(ref.timestamp.get()), ref.commitHash })
+                            .toList());
         }
 
         @Override
         public void saveRelease(String repoName, String releaseName, long releaseTimestamp, String commitHash) {
+            jdbcTemplate.update("insert into Releases(Repo_Name, Release_Name, Release_Timestamp, Commit_Hash) values(?, ?, ?, ?)",
+                    repoName, releaseName, new Date(releaseTimestamp), commitHash);
+        }
+    }
 
+    static class SimpleRef {
+        final String name;
+        final Optional<Long> timestamp;
+        final String commitHash;
+
+        SimpleRef(String name, Optional<Long> timestamp, String commitHash) {
+            this.name = name;
+            this.timestamp = timestamp;
+            this.commitHash = commitHash;
         }
     }
 }
