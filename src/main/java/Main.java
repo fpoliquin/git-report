@@ -10,16 +10,24 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
+import javax.sql.DataSource;
+
 import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.Ref;
 import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.jgit.storage.file.FileRepositoryBuilder;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
+import org.springframework.jdbc.core.simple.SimpleJdbcInsert;
+
+import com.microsoft.sqlserver.jdbc.SQLServerConnectionPoolDataSource;
 
 public class Main {
 
 	public static void main(String[] args) throws Exception {
+        final String connectionString = Files.readString(Path.of("connection-string.txt"));
         final Path tempPath = Path.of("target", "checkout");
         // final Path tempPath = Path.of("C:\\Dev\\src\\campus\\mpo\\mpo-ui\\.git");
         final String repoName = "mpo-ui";
@@ -28,9 +36,20 @@ public class Main {
             throw new RuntimeException("The path " + tempPath + " does not exist.");
         }
 
-        CommitDatabase database = new DummyCommitDatabase();
+        CommitDatabase database = connectToDatabase(connectionString);
 
         exportRepo(tempPath, repoName, database);
+    }
+
+    private static CommitDatabase connectToDatabase(String connectionString) {
+
+        // DataSource dataSource = new SimpleDriverDataSource();
+        SQLServerConnectionPoolDataSource dataSource = new SQLServerConnectionPoolDataSource();
+        dataSource.setURL(connectionString);
+
+        JdbcCommitDatabase database = new JdbcCommitDatabase(dataSource);
+        database.pingDatabase();
+        return database;
     }
 
     private static void exportRepo(final Path tempPath, final String repoName, CommitDatabase database) throws Exception {
@@ -38,11 +57,13 @@ public class Main {
 		
         long snapshotId = database.createSnapshot(repoName);
 
+        System.out.println("Created snapshot " + snapshotId);
+
         saveBranches(database, repoName, snapshotId, findBranchesSortedByDate(repository));
         
-        saveReleases(repository, database, repoName);
+        // saveReleases(repository, database, repoName);
 
-        saveCommits(repository, database, repoName);
+        // saveCommits(repository, database, repoName);
     }
 
     static void saveCommits(Repository repo, CommitDatabase database, String repoName) throws Exception {
@@ -182,6 +203,47 @@ public class Main {
         @Override
         public long createSnapshot(String repoName) {
             return 1;
+        }
+
+        @Override
+        public void saveCommit(String repoName, String hash, long commitTimestamp, String releaseName, Optional<Long> releaseTimestamp, Set<String> parents) {
+
+            System.out.println("Commit " + hash + ": " + releaseName);
+        }
+
+        @Override
+        public void saveBranch(String repoName, long snapshotId, String branchName, String commitHash) {
+
+        }
+
+        @Override
+        public void saveRelease(String repoName, String releaseName, long releaseTimestamp, String commitHash) {
+
+        }
+    }
+
+    static class JdbcCommitDatabase implements CommitDatabase {
+        private final JdbcTemplate jdbcTemplate;
+
+        public JdbcCommitDatabase(DataSource dataSource) {
+            this.jdbcTemplate = new JdbcTemplate(dataSource);
+        }
+
+        public void pingDatabase() {
+            jdbcTemplate.queryForObject("select 1", Integer.class);
+        }
+
+        @Override
+        public long createSnapshot(String repoName) {
+            SimpleJdbcInsert insert = new SimpleJdbcInsert(jdbcTemplate);
+            insert.setGeneratedKeyName("Snapshot_Id");
+            insert.setColumnNames(Arrays.asList("Repo_Name", "Snapshot_Timestamp"));
+            insert.setTableName("Snapshots");
+            Number generatedId = insert.executeAndReturnKey(new MapSqlParameterSource()
+                    .addValue("Repo_Name", repoName)
+                    .addValue("Snapshot_Timestamp", new Date()));
+
+            return generatedId.longValue();
         }
 
         @Override
